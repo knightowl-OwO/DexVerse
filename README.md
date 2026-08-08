@@ -22,7 +22,7 @@
 
 - [x] Initial release: task suite, assets
 - [x] Release teleoperation and data-collection tooling and corresponding documentations
-- [ ] Baseline environment demonstrations and baseline code
+- [x] Baseline environment demonstrations and baseline code
 - [ ] Full shadowhand demonstration dataset
 - [ ] Cross-embodiment robot assets, instructions, and demonstrations
 
@@ -47,6 +47,7 @@ DexVerse/
 │   │   ├── assets/                          # Asset configs (objects, scenes, background HDRIs, ...)
 │   │   ├── devices/                         # Teleop input devices (OpenXR, retargeters)
 │   │   ├── robot_agents/                    # Per-robot-hand configs
+│   │   ├── IL/                              # Imitation-learning baselines (Diffusion Policy)
 │   │   └── utils/                           # Shared utilities
 │   ├── demonstrations/                  # Demonstration data (populated by download_demos.py)
 │   ├── docker_utils/                    # Docker Compose patch for IsaacLab. 
@@ -58,7 +59,8 @@ DexVerse/
 │   ├── record_demos.py                  # Demonstration recording
 │   ├── run_dexverse.py                  # Joint-slider debug UI
 │   ├── asset_tools/                     # Asset download utilities
-│   └── demo_tools/                      # Demo download / conversion / inspection utilities
+│   ├── demo_tools/                      # Demo download / conversion / inspection utilities
+│   └── diffusion/                       # Diffusion Policy baseline: replay, train, evaluate
 ├── datastorage/                     # Host-mounted demo output (Docker; gitignored contents)
 └── docs/                            # Repo-level docs (observation space, known hand issues)
 ```
@@ -401,9 +403,69 @@ See also `source/dexverse/docker_utils/README.md` for Docker mount details.
 
 ## Demonstrations
 
-> 🚧 **Data and Instructions Coming soon.** 
+Demonstrations are hosted on the Hugging Face dataset
+[`dexverse/DexVerse_Dataset`](https://huggingface.co/datasets/dexverse/DexVerse_Dataset) under the
+`demonstrations/<category>/<task>/` prefix, and fetched into `source/dexverse/demonstrations/` by
+`scripts/demo_tools/download_demos.py`. The dataset is gated: run `huggingface-cli login` once and
+accept the terms on the dataset page first.
 
+```bash
+# The curated baseline set: 19 tasks, 50 successful teleoperated episodes each
+python scripts/demo_tools/download_demos.py --baseline
 
+# Or everything / one category / one task
+python scripts/demo_tools/download_demos.py --all
+python scripts/demo_tools/download_demos.py --category functional
+python scripts/demo_tools/download_demos.py --task functional/Dexverse-GraspPan-v0
+
+# See what is available without downloading
+python scripts/demo_tools/download_demos.py --list
+```
+
+The baseline set is what the Diffusion Policy baseline below is trained on; the tasks it covers are
+listed in `source/dexverse/demonstrations/baseline_manifest.txt`. Each task has one pickle recorded
+with the floating Shadow hand, holding per-step actions and full scene states.
+
+## Diffusion Policy Baseline
+
+A state-based [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) baseline lives in
+`source/dexverse/dexverse/IL/diffusion/`, with entry points in `scripts/diffusion/`. The policy
+observes a flat state vector (the `policy`, `proprio`, `state`, `privileged`, `goal` and `contact`
+observation groups concatenated) and predicts 16-step action chunks with a conditional 1-D UNet
+denoiser, replanning every 4 environment steps.
+
+It needs one extra dependency:
+
+```bash
+pip install diffusers
+```
+
+Three stages, one task at a time:
+
+```bash
+# 1. Replay the demonstrations in simulation and build the training dataset
+#    -> datasets/diffusion/<TASK>.h5
+TASK=Dexverse-GraspKettle-v0 bash scripts/diffusion/replay.sh
+
+# 2. Train (pure PyTorch; ~10 min for 300 epochs on one RTX 6000 Ada)
+#    -> runs/dp_<TASK>/best.pt
+TASK=Dexverse-GraspKettle-v0 bash scripts/diffusion/train.sh
+
+# 3. Evaluate closed-loop and report success rate
+#    -> runs/dp_<TASK>/eval/metrics.json
+TASK=Dexverse-GraspKettle-v0 bash scripts/diffusion/evaluate.sh
+```
+
+Each script takes `GPU=<index>` to choose a device, and `evaluate.sh` takes `EPISODES=<n>`
+(default 50). The Python entry points behind them expose the full option set via `--help`:
+`build_dataset.py`, `train.py` and `eval_online.py`.
+
+Two things must stay consistent across the stages, and the shell scripts handle both. `replay.sh`
+captures observations with `--obs-groups state` and `evaluate.sh` passes the matching
+`--observation_preset state`, so the live environment publishes the same observation groups the
+policy was trained on. And the replay records the environment's observation-term order into the
+HDF5, which `build_dataset.py` uses to rebuild the state vector in exactly the order the evaluation
+runner will see it.
 
 ## Contact
 

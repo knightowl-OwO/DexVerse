@@ -39,6 +39,8 @@ Example::
 import argparse
 import json
 import pickle
+import sys
+import traceback
 from pathlib import Path
 from typing import NamedTuple
 
@@ -184,7 +186,10 @@ _preset_has_camera = _obs_preset_arg in {
     "3view_rgb_depth",
     "3view_pointcloud",
 }
-if args_cli.record_video or _capture_all_groups or _preset_has_camera or (_obs_groups_lower & _CAMERA_OBS_GROUPS):
+_NEEDS_CAMERAS = bool(
+    args_cli.record_video or _capture_all_groups or _preset_has_camera or (_obs_groups_lower & _CAMERA_OBS_GROUPS)
+)
+if _NEEDS_CAMERAS:
     args_cli.enable_cameras = True
 
 if args_cli.enable_pinocchio:
@@ -206,6 +211,7 @@ import numpy as np  # noqa: E402
 from dexverse.tasks.utils import parse_env_cfg  # noqa: E402
 from isaaclab.managers import TerminationTermCfg as DoneTerm  # noqa: E402
 from isaaclab.managers.manager_base import ManagerTermBase  # noqa: E402
+from isaaclab.sensors import TiledCameraCfg  # noqa: E402
 
 try:
     from tqdm.auto import tqdm  # noqa: E402
@@ -400,6 +406,26 @@ def _refresh_after_set_state(env):
     env.scene.update(dt=env.physics_dt)
 
 
+def _set_last_action(env, action: torch.Tensor) -> None:
+    """Write a recorded action into the action manager's buffers.
+
+    The ``--set-state`` path never calls ``env.step``, so the action manager's
+    ``_action`` / ``_prev_action`` buffers stay at their zero reset value, and any
+    observation term reading them -- notably ``mdp.last_action``, which is the
+    whole ``policy`` group -- gets recorded as all-zeros for the entire episode.
+    Policies trained on such a recording see zeros there but their own previous
+    action at evaluation time, and fail.
+
+    The buffers are set directly rather than through ``process_action`` so no
+    action term applies side effects to the scene we just restored.
+    """
+    manager = getattr(env, "action_manager", None)
+    if manager is None:
+        return
+    manager._prev_action[:] = manager._action
+    manager._action[:] = action.to(manager.device)
+
+
 def _has_multi_asset_or_usd(scene_cfg) -> bool:
     """Spot the per-episode binding case so we can warn before silently breaking it."""
     for name in dir(scene_cfg):
@@ -444,6 +470,16 @@ class ObsGroupCapture:
     @property
     def group_names(self) -> list[str]:
         return list(self._group_names)
+
+    @property
+    def term_names_by_group(self) -> dict[str, list[str]]:
+        """Per-group term order as declared on the ObservationManager.
+
+        This is the order a ``concatenate_terms=True`` group uses internally, so
+        writers persist it and readers that re-concatenate the per-term datasets
+        can reproduce the env's own layout instead of guessing.
+        """
+        return {g: list(self._term_names[g]) for g in self._group_names}
 
     def capture(self, env_id: int = 0) -> dict[str, np.ndarray]:
         flat: dict[str, np.ndarray] = {}
@@ -502,6 +538,7 @@ class PerPickleH5Writer:
         compression: str,
         compression_opts: int,
         observation_preset: str | None = None,
+        term_order_by_group: dict[str, list[str]] | None = None,
     ):
         output_file.parent.mkdir(parents=True, exist_ok=True)
         self._output_file = output_file
@@ -527,6 +564,12 @@ class PerPickleH5Writer:
         self._h5.attrs["observation_preset"] = observation_preset or ""
         # Marker so readers can tell sequential outputs from parallel ones.
         self._h5.attrs["replay_mode"] = "sequential"
+        # ObservationManager term order per group. Readers that rebuild a flat
+        # observation vector from the per-term datasets (e.g.
+        # scripts/diffusion/build_dataset.py) need this; alphabetical key order
+        # silently produces a different layout than the live environment.
+        if term_order_by_group:
+            self._h5.attrs["term_order"] = json.dumps({g: list(terms) for g, terms in term_order_by_group.items()})
         self._counter = 0
 
     def write_episode(
@@ -883,11 +926,22 @@ def _build_env_for_pickle(payload: dict):
         env_cfg.observation_preset = _obs_preset_arg
         env_cfg._apply_observation_preset(_obs_preset_arg)
 
-    # IsaacLab default is 0 — without it, the RTX camera buffer is stale after
-    # reset, so per-episode lighting/texture randomizers won't appear in the
-    # first captured frame. In sequential mode every episode is a fresh reset,
-    # so we always want a few extra renders to let RTX settle.
-    env_cfg.num_rerenders_on_reset = 4
+    if _NEEDS_CAMERAS:
+        # IsaacLab default is 0 — without it, the RTX camera buffer is stale after
+        # reset, so per-episode lighting/texture randomizers won't appear in the
+        # first captured frame. In sequential mode every episode is a fresh reset,
+        # so we always want a few extra renders to let RTX settle.
+        env_cfg.num_rerenders_on_reset = 4
+    else:
+        # State-only capture: drop the scene's camera sensors. Most task configs
+        # declare them, and sensor_base aborts gym.make when a camera is present
+        # but cameras were never enabled. Removing them also skips the per-step
+        # RTX render for buffers nobody reads. Camera *bodies* (collision mounts,
+        # AssetBaseCfg) are left alone.
+        for attr, value in list(vars(env_cfg.scene).items()):
+            if isinstance(value, TiledCameraCfg):
+                setattr(env_cfg.scene, attr, None)
+        env_cfg.num_rerenders_on_reset = 0
 
     env = gym.make(task_name, cfg=env_cfg).unwrapped
     return env, env_cfg, env_name, task_name, termination_cfgs
@@ -997,6 +1051,7 @@ def _replay_one_episode(
                 )
                 env.scene.reset_to(step_state, env_ids_one, is_relative=True)
                 _refresh_after_set_state(env)
+                _set_last_action(env, action_batched)
                 _get_runtime_obs(env, update_history=True)
             else:
                 env.step(action_batched)
@@ -1102,6 +1157,7 @@ def _convert_one_group(group: PickleGroup) -> tuple[int, int, int]:
             compression=args_cli.compression,
             compression_opts=args_cli.compression_opts,
             observation_preset=_obs_preset_arg,
+            term_order_by_group=capture.term_names_by_group,
         )
         if args_cli.record_video:
             video = VideoRecorder(
@@ -1193,6 +1249,13 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         rc = main()
+    except BaseException:
+        # simulation_app.close() can os._exit(0) before the interpreter prints
+        # the traceback, which turns any failure in main() into a silent exit 0.
+        # Print it ourselves while we still can.
+        traceback.print_exc()
+        sys.stderr.flush()
+        raise
     finally:
         simulation_app.close()
     raise SystemExit(rc)
