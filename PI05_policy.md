@@ -40,7 +40,7 @@ PI0.5 推理被拆成两个进程：Isaac Sim 进程负责环境、相机和评�
 
 ### `scripts/demo_tools/dexverse_h5_to_lerobot.sh`
 
-提供上述转换的快捷启动器，默认使用 `lerobot` 环境和 60 FPS。脚本中的 Conda 路径、数据路径以及 Python 文件路径是机器相关配置，提交前应改为可配置参数；直接使用时请确认这些路径与本机一致。当前脚本中的 Python 文件名和相对路径需要先核对（现有调用写成了 `dexverse_h5tolerobot.py`，而实际文件名为 `dexverse_h5_to_lerobot.py`），否则应直接使用上面的 Python 命令。
+提供上述转换的快捷启动器，默认使用 `lerobot` 环境和 60 FPS。脚本中的 Conda 路径、数据路径以及 Python 文件路径是机器相关配置，提交前应改为可配置参数；直接使用时请确认这些路径与本机一致。
 
 ## PI0.5 微调
 
@@ -113,7 +113,3 @@ bash scripts/pi05_eval.sh
 ```
 
 评估脚本中的 `CHECKPOINT`、任务名、socket、输出目录和设备均可按机器修改；默认路径指向本项目当前的 `/home/dehand/dex_eval` 布局。
-
-## 与数据采集链路的关系
-
-Tracking Streamer/`avp_stream` 只负责产生遥操示范数据；PI0.5 分支新增的是离线数据转换、策略训练和自动评估，不改变 CloudXR 或 Vision Pro 设备实现。生成的 `demo/`、`visionpro_test/`、模型 checkpoint、缓存和评估输出属于运行产物，不应作为源代码贡献的一部分提交。
