@@ -22,7 +22,7 @@
 
 - [x] Initial release: task suite, assets
 - [x] Release teleoperation and data-collection tooling and corresponding documentations
-- [ ] Baseline environment demonstrations and baseline code
+- [x] Baseline environment demonstrations and baseline code
 - [ ] Full shadowhand demonstration dataset
 - [ ] Cross-embodiment robot assets, instructions, and demonstrations
 
@@ -49,6 +49,7 @@ DexVerse/
 │   │   ├── assets/                          # Asset configs (objects, scenes, background HDRIs, ...)
 │   │   ├── devices/                         # Teleop input devices (OpenXR, retargeters)
 │   │   ├── robot_agents/                    # Per-robot-hand configs
+│   │   ├── IL/                              # Imitation-learning baselines (DP and DP3)
 │   │   └── utils/                           # Shared utilities
 │   ├── demonstrations/                  # Demonstration data (populated by download_demos.py)
 │   └── docker_utils/                    # Docker Compose patch for IsaacLab
@@ -59,7 +60,9 @@ DexVerse/
 │   ├── record_demos.py                  # Demonstration recording
 │   ├── run_dexverse.py                  # Joint-slider debug UI
 │   ├── asset_tools/                     # Asset download utilities
-│   └── demo_tools/                      # Demo download / conversion / inspection utilities
+│   ├── demo_tools/                      # Demo download / conversion / inspection utilities
+│   ├── diffusion/                       # State-based Diffusion Policy baseline
+│   └── dp3/                             # Point-cloud-based Diffusion Policy baseline
 ├── datastorage/                     # Host-mounted demo output (Docker; gitignored contents)
 └── docs/                            # Demo conversion guide and project images
 ```
@@ -475,7 +478,32 @@ See [demo download and H5 conversion](docs/demo_conversion.md) for versioned tas
 selection. The dataset manifest lists available recordings; the dataset card
 specifies their license. Demonstrations are distributed separately from the code.
 
+```bash
+# Download available curated demonstrations for both baseline task versions.
+python scripts/demo_tools/download_demos.py --baseline
+```
 
+## Imitation-Learning Baselines
+
+State-based [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) lives in
+`dexverse.IL.diffusion`, with entry points in `scripts/diffusion/`.
+[DP3](source/dexverse/dexverse/IL/dp3/README.md) uses point clouds and proprioception,
+with entry points in `scripts/dp3/`. Install their optional dependencies with:
+
+```bash
+python -m pip install -e "source/dexverse[dp3]"
+```
+
+First convert a versioned task's demonstrations with
+`scripts/demo_tools/create_demo_files_sequential.py`: use `--obs-groups state`
+for DP or `--obs-groups pointcloud` for DP3. Then build the training dataset
+with `scripts/diffusion/build_dataset.py` or `scripts/dp3/convert_demos_to_dp3.py`,
+respectively. Each baseline provides `train.py` and `eval_online.py`; see their
+`--help` output for arguments.
+
+Keep the task version and observation preset consistent through conversion,
+training, and evaluation. The state converter records observation-term order so
+DP can reconstruct the same state layout at training and evaluation time.
 
 ## Contact
 

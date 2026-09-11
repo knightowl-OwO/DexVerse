@@ -984,6 +984,9 @@ def _build_env_for_pickle(payload: dict):
         env_cfg.num_rerenders_on_reset = 0
         print("  [info] camera-free capture: scene camera sensors stripped (--no-strip-cameras keeps them).")
 
+    from dexverse.replay_rigid_object import configure_replay_rigid_objects
+
+    configure_replay_rigid_objects(env_cfg.scene)
     env = gym.make(task_name, cfg=env_cfg).unwrapped
     return env, env_cfg, env_name, task_name, termination_cfgs
 
