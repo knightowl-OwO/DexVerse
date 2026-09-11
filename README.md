@@ -142,15 +142,16 @@ python -m pip install matplotlib "opencv-python<4.12" open3d imageio-ffmpeg "num
 
 ## Downloading Assets
 
-The robot hand and object/scene assets are not stored in the git repository. They are hosted on the gated
+The robot hand and object/scene assets are not stored in the git repository. They are hosted on the public
 Hugging Face dataset [`dexverse/DexVerse_release`](https://huggingface.co/datasets/dexverse/DexVerse_release)
-and must be downloaded before any environment can run. Log in once and accept the dataset terms:
+and must be downloaded before any environment can run. No Hugging Face login is required:
 
 ```bash
 pip install huggingface_hub
-hf auth login   # and follow the prompt to login to hugging face
-# alternatively, you can create hugging face tokens and set the environmetn HF_TOKEN=<your-token> 
 ```
+
+Robot, asset, and demo downloaders default to this release. Use `--repo OWNER/DATASET`
+to override it; `hf auth login` is only needed if that dataset requires authentication.
 
 
 

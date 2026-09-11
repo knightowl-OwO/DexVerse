@@ -2,6 +2,7 @@
 
 import json
 from pathlib import Path
+import runpy
 import sys
 from types import SimpleNamespace
 
@@ -43,6 +44,13 @@ def test_baseline_defaults_to_both_versions():
     assert sum(p.startswith("demonstrations/v0/") for p in patterns) == 20
     assert sum(p.startswith("demonstrations/v1/") for p in patterns) == 20
     assert len(download._build_patterns(args(baseline=True, version="v1"))) == 20
+
+
+def test_all_release_downloaders_share_public_repo_default():
+    assert download.DEFAULT_REPO == "dexverse/DexVerse_release"
+    tools = Path(__file__).resolve().parents[1] / "asset_tools"
+    for script in ("download_assets.py", "download_robot_agents.py"):
+        assert runpy.run_path(str(tools / script))["DEFAULT_REPO"] == download.DEFAULT_REPO
 
 
 def test_explicit_task_and_category_patterns():
@@ -156,20 +164,26 @@ def test_corrupt_download_not_installed(tmp_path):
 
 
 @pytest.mark.parametrize("mode", ["normal", "dry", "strict"])
-def test_download_cli_pins_revision_and_honors_no_fetch_modes(tmp_path, monkeypatch, mode):
+@pytest.mark.parametrize("repo", [None, "owner/test"])
+def test_download_cli_pins_revision_and_honors_no_fetch_modes(tmp_path, monkeypatch, mode, repo):
     root, data, _ = fixture_release(tmp_path)
     calls = []
+    expected_repo = repo or "dexverse/DexVerse_release"
     class API:
         def repo_info(self, **kwargs):
+            assert kwargs["repo_id"] == expected_repo
             assert kwargs["revision"] == "a-tag"
             return SimpleNamespace(sha="immutable-commit")
     def fetch(**kwargs):
+        assert kwargs["repo_id"] == expected_repo
         assert kwargs["revision"] == "immutable-commit"
         calls.append(kwargs["filename"])
         return str(root / kwargs["filename"])
     monkeypatch.setitem(sys.modules, "huggingface_hub", SimpleNamespace(HfApi=API, hf_hub_download=fetch))
     monkeypatch.setitem(sys.modules, "huggingface_hub.errors", SimpleNamespace(EntryNotFoundError=FileNotFoundError))
-    argv = ["download", "--repo", "owner/test", "--revision", "a-tag", "--baseline", "--dest", str(tmp_path / "dest")]
+    argv = ["download", "--revision", "a-tag", "--baseline", "--dest", str(tmp_path / "dest")]
+    if repo is not None:
+        argv.extend(["--repo", repo])
     if mode == "dry":
         argv.append("--dry-run")
     if mode == "strict":

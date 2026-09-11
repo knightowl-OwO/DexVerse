@@ -11,7 +11,8 @@
 --baseline selects BOTH v0 and v1 by default, using the remote release manifest.
 Absent/skipped tasks are reported, never silently substituted with another version.
 For older unversioned datasets, use --legacy explicitly (v0 only). No pickle is
-unpickled during download. Authenticate with `hf auth login` for gated/private repos.
+unpickled during download. The default release is public and needs no login.
+Authenticate with `hf auth login` only when using a gated/private --repo override.
 """
 
 from __future__ import annotations
@@ -22,7 +23,7 @@ from pathlib import Path
 
 from demo_release import DEMOS, MANIFEST, baseline_entries, baseline_key, contained_path, install_file, read_manifest, safe_relative, sha256
 
-DEFAULT_REPO = "dexverse/DexVerse_Dataset"
+DEFAULT_REPO = "dexverse/DexVerse_release"
 DEFAULT_REPO_TYPE = "dataset"
 DEFAULT_DEST = DEMOS
 REMOTE_ROOT = "demonstrations"
@@ -114,7 +115,7 @@ def fetch_selected(entries, dest, fetch):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--repo", default=DEFAULT_REPO)
+    parser.add_argument("--repo", default=DEFAULT_REPO, help="HF repo id (default: %(default)s)")
     parser.add_argument("--repo-type", default=DEFAULT_REPO_TYPE, choices=("dataset", "model", "space"))
     parser.add_argument("--revision", default="main", help="Branch, tag, or pinned commit")
     parser.add_argument("--dest", type=Path, default=DEFAULT_DEST)

@@ -6,12 +6,11 @@ supported NVIDIA GPU for startup/rendering even when physics uses CPU.
 
 ## Download
 
-Once the versioned release is available in the dataset repository:
+The downloader defaults to the public `dexverse/DexVerse_release` dataset; no login is required:
 
 ```bash
 conda activate dexverse
-python scripts/demo_tools/download_demos.py \
-  --repo dexverse/DexVerse_release --baseline
+python scripts/demo_tools/download_demos.py --baseline
 ```
 
 `--baseline` selects available v0 and v1 sets. Use `--version v0` or `--version v1`
