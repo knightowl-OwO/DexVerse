@@ -26,6 +26,18 @@ INSTALL_REQUIRES = [
     "psutil",
 ]
 
+# Optional dependencies for the imitation-learning baselines
+EXTRAS_REQUIRE = {
+    # 3D Diffusion Policy baseline (dexverse.IL.dp3 + scripts/dp3)
+    "dp3": [
+        "diffusers",
+        "einops",
+        "h5py",
+        "omegaconf",
+        "termcolor",
+    ],
+}
+
 # Installation operation
 setup(
     name="dexverse",
@@ -37,6 +49,7 @@ setup(
     description=EXTENSION_TOML_DATA["package"]["description"],
     keywords=EXTENSION_TOML_DATA["package"]["keywords"],
     install_requires=INSTALL_REQUIRES,
+    extras_require=EXTRAS_REQUIRE,
     license="BSD-3-Clause",
     include_package_data=True,
     python_requires=">=3.11",
