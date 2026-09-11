@@ -119,6 +119,9 @@ def _make_env(cfg: EvalConfig):
         success_probe = _SuccessProbe(success_cfg)
         env_cfg.terminations.success = None
 
+    from dexverse.replay_rigid_object import configure_replay_rigid_objects
+
+    configure_replay_rigid_objects(env_cfg.scene)
     env = gym.make(cfg.task, cfg=env_cfg, render_mode="rgb_array" if cfg.video else None)
     if cfg.video:
         video_dir = Path(cfg.output_dir) / "videos"
