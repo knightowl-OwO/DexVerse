@@ -14,7 +14,11 @@ This script allows users to record demonstrations operated by VR hand tracking f
 specified task. Each session is stored as a single pickle file containing the task
 name, optional object USD path / robot variant, the initial scene state captured
 via ``env.scene.get_state(is_relative=True)`` (robot + object + any other scene
-entity) and the per-step teleop actions. ``replay_demos.py`` can load this pickle
+entity) and the per-step teleop actions. For arm-mounted embodiments controlled via
+differential IK (e.g. ``fr3_sharpa_right``), the per-step commanded arm joint targets
+(``joint_pos_target``) are also recorded as ``arm_joint_actions``, since the IK
+action space itself is an EE pose rather than raw joint targets.
+``replay_demos.py`` can load this pickle
 to reconstruct the environment, restore the initial state and replay the actions
 to regenerate the corresponding observations.
 
@@ -32,6 +36,9 @@ Optional arguments:
     --record_state            Enable recording per-step scene states (T+1 snapshots per episode).
     --num_demos               Number of demonstrations to record. (default: 0, infinite)
     --num_success_steps       Number of continuous steps with task success for concluding a demo as successful. (default: 10)
+    --seed                    Seed for the environment's reset/spawn randomization. Default None keeps
+                              the task default (DexVerseBaseEnvCfg.seed = 42); -1 draws a random seed.
+                              The resolved seed is stored in the pickle metadata.
     --enable_pinocchio        Enable Pinocchio. Auto-enabled for handtracking / motion controllers
                               because dex-retargeting requires it.
 """
@@ -52,6 +59,8 @@ from pathlib import Path
 import numpy as np
 import torch
 from dexverse.demo_paths import DEXVERSE_DATA_DIR_ENV, get_dexverse_data_dir, resolve_demo_output_path
+from dexverse.benchmark import action_layout, task_identity
+from dexverse.teleop_utils.debug_visualization import add_debug_visualization_args, configure_v1_debug_visualization
 from isaaclab.app import AppLauncher
 
 logger = logging.getLogger(__name__)
@@ -96,6 +105,17 @@ parser.add_argument(
     help="Number of continuous steps with task success for concluding a demo as successful. Default is 10.",
 )
 parser.add_argument(
+    "--seed",
+    type=int,
+    default=None,
+    help=(
+        "Seed for the environment's reset/spawn randomization (object spawn poses, "
+        "goal sampling, multi-asset/multi-USD choice). Default None keeps the task "
+        "default seed (42); pass -1 to draw a random seed. Record with seeds disjoint "
+        "from the evaluation seeds so train and eval setups come from different draws."
+    ),
+)
+parser.add_argument(
     "--enable_pinocchio",
     action="store_true",
     default=False,
@@ -112,8 +132,9 @@ parser.add_argument(
     type=str,
     default=None,
     help=(
-        "Optional robot variant override for environments that expose 'robot_type' "
-        "(floating_shadow_right, floating_shadow_left, floating_shadow_bimanual)."
+        "Optional robot variant override for environments that expose 'robot_type'. "
+        "Supported variants: floating_shadow_right, floating_shadow_left, "
+        "floating_shadow_bimanual."
     ),
 )
 parser.add_argument(
@@ -126,14 +147,36 @@ parser.add_argument(
         "file (single-object mode) or a directory of USDs (object-pool mode)."
     ),
 )
+add_debug_visualization_args(parser, teleop=True)
 parser.add_argument(
-    "--enable_debug_vis",
-    action=argparse.BooleanOptionalAction,
-    default=None,
+    "--show_ranges",
+    action="store_true",
+    default=False,
     help=(
-        "Override the task's debug-visualization toggle (zone / reference-point "
-        "markers). Use --enable_debug_vis to force on, --no-enable_debug_vis to "
-        "force off; omit to use the task's default."
+        "Outline the task's randomization ranges -- object spawn envelopes and "
+        "goal sampling boxes -- as wireframe boxes, so the operator can see the "
+        "space the task samples from. Operator-only: the markers are tagged "
+        "purpose=guide and stay out of recorded camera observations."
+    ),
+)
+parser.add_argument(
+    "--show_stats",
+    action=argparse.BooleanOptionalAction,
+    default=False,
+    help=(
+        "After every recorded trajectory, re-score demonstration diversity and "
+        "show it as an in-headset panel (and a PNG/JSON beside the demos). "
+        "Off by default (it has crashed teleop sessions); pass --show_stats to enable."
+    ),
+)
+parser.add_argument(
+    "--stats_history",
+    action=argparse.BooleanOptionalAction,
+    default=True,
+    help=(
+        "Fold previously recorded pickles for this task into the statistics, so "
+        "the panel describes the whole dataset rather than just this session. "
+        "--no-stats_history scores only the current session."
     ),
 )
 parser.add_argument(
@@ -161,6 +204,13 @@ parser.add_argument(
 )
 
 AppLauncher.add_app_launcher_args(parser)
+# Demonstration recording is also a live teleoperation path, so prefer low
+# rendering latency by default. This affects the viewport / XR stream only;
+# it does not resize or remove scene-camera observations saved for replay.
+# Pass ``--rendering_mode balanced`` or ``quality`` when desired.
+# Match the historical XR collection default explicitly, including non-XR
+# recording. GPU rendering is independent; an explicit --device can override.
+parser.set_defaults(rendering_mode="performance", device="cpu")
 args_cli, unknown_args = parser.parse_known_args()
 
 # Support lightweight Hydra-style env override parity with teleop_agent.py.
@@ -177,6 +227,8 @@ for raw_arg in unknown_args:
         args_cli.retargeting_scheme = raw_arg.split("=", 1)[1]
     elif raw_arg.startswith("env.enable_debug_vis="):
         args_cli.enable_debug_vis = raw_arg.split("=", 1)[1].strip().lower() in ("1", "true", "yes")
+    elif raw_arg.startswith("env.seed="):
+        args_cli.seed = int(raw_arg.split("=", 1)[1])
     else:
         parser.error(f"unrecognized arguments: {raw_arg}")
 
@@ -235,6 +287,7 @@ from dexverse.tasks.utils import (  # noqa: E402
     prune_stale_obs_refs,
     strip_camera_cfgs,
 )
+from dexverse.teleop_utils.episode_task_state import capture_episode_task_state  # noqa: E402
 from isaaclab.devices.teleop_device_factory import create_teleop_device  # noqa: E402
 from isaaclab.envs import DirectRLEnvCfg, ManagerBasedRLEnvCfg  # noqa: E402
 
@@ -245,12 +298,17 @@ class TrajectoryPickleRecorder:
     Each recorded session is written to a single pickle file that contains the
     environment metadata (task name, object USD path, robot variant), the initial
     scene state captured via ``env.scene.get_state(is_relative=True)`` and the
-    per-step teleop actions. ``replay_demos.py`` consumes this pickle to rebuild
+    per-step teleop actions. When the robot exposes arm joints (via
+    ``robot_config.arm_joint_names_expr``), the per-step commanded arm joint
+    targets are additionally recorded as ``arm_joint_actions`` (indexed by
+    ``arm_joint_names`` in the pickle's top-level metadata) since the teleop
+    ``actions`` for IK-controlled arms are EE poses, not joint targets.
+    ``replay_demos.py`` consumes this pickle to rebuild
     the environment, restore the initial robot + object state and replay the
     actions to regenerate observations.
     """
 
-    SCHEMA_VERSION = 3
+    SCHEMA_VERSION = 5
     FORMAT_TAG = "dexverse_trajectory"
 
     def __init__(
@@ -263,12 +321,21 @@ class TrajectoryPickleRecorder:
         usd_path: str | None = None,
         robot_type: str | None = None,
         json_path: str | None = None,
+        arm_joint_names: list[str] | None = None,
+        seed: int | None = None,
+        action_layout_metadata: dict | None = None,
+        sim_device: str | None = None,
     ):
         self._output_file = output_file
         os.makedirs(os.path.dirname(output_file) or ".", exist_ok=True)
         self._episodes: list[dict] = []
         self._active_episode: dict | None = None
+        self._reset_attempts: list[dict] = []
+        self._active_reset_id: int | None = None
+        self._next_reset_id = 0
         self._record_state = bool(record_state)
+        self._arm_joint_names = list(arm_joint_names) if arm_joint_names else None
+        self._record_arm_joint_actions = self._arm_joint_names is not None
         self._metadata = {
             "format": self.FORMAT_TAG,
             "schema_version": self.SCHEMA_VERSION,
@@ -278,11 +345,80 @@ class TrajectoryPickleRecorder:
             "usd_path": usd_path,
             "robot_type": robot_type,
             "json_path": json_path,
+            "arm_joint_names": self._arm_joint_names,
+            "seed": seed,
+            "sim_device": sim_device,
+            **task_identity(env_name or task_name),
+            "action_layout": action_layout_metadata,
         }
 
     @property
     def num_episodes(self) -> int:
         return len(self._episodes)
+
+    @property
+    def episodes(self) -> list[dict]:
+        """Finalized episodes, in the schema the diversity metrics parse.
+
+        Exposed so the live stats panel can score the session straight from
+        memory instead of re-reading the pickle after every trajectory.
+        """
+        return self._episodes
+
+    @property
+    def current_reset_id(self) -> int | None:
+        return self._active_reset_id
+
+    @property
+    def num_reset_attempts(self) -> int:
+        return len(self._reset_attempts)
+
+    def start_reset_attempt(self) -> int:
+        """Open a ledger entry for the scene produced by one environment reset."""
+        if self._active_reset_id is not None:
+            raise RuntimeError(f"Reset {self._active_reset_id} is still active.")
+        reset_id = self._next_reset_id
+        self._next_reset_id += 1
+        self._active_reset_id = reset_id
+        return reset_id
+
+    def _finalize_reset_attempt(
+        self,
+        outcome: str,
+        *,
+        reason: str,
+        num_steps: int,
+        successful_episode_index: int | None = None,
+    ) -> None:
+        if self._active_reset_id is None:
+            return
+        if outcome not in {"success", "failed", "skipped"}:
+            raise ValueError(f"Unknown reset outcome: {outcome!r}")
+        entry = {
+            "reset_id": self._active_reset_id,
+            "outcome": outcome,
+            "reason": reason,
+            "num_steps": int(num_steps),
+        }
+        if successful_episode_index is not None:
+            entry["successful_episode_index"] = int(successful_episode_index)
+        self._reset_attempts.append(entry)
+        self._active_reset_id = None
+
+    def finish_reset_without_success(self, *, reason: str) -> str | None:
+        """Close the current reset as failed (actions exist) or skipped (none)."""
+        if self._active_reset_id is None:
+            return None
+        if self._active_episode is not None:
+            num_steps = len(self._active_episode.get("actions", []))
+            self._active_episode = None
+            outcome = "failed" if num_steps > 0 else "skipped"
+        else:
+            num_steps = 0
+            outcome = "skipped"
+        self._finalize_reset_attempt(outcome, reason=reason, num_steps=num_steps)
+        self.flush()
+        return outcome
 
     def has_active_episode(self) -> bool:
         return self._active_episode is not None
@@ -291,22 +427,30 @@ class TrajectoryPickleRecorder:
         self,
         initial_state,
         goal_pose=None,
+        task_state=None,
         multi_assets=None,
         multi_usds=None,
         active_object_metadata=None,
     ) -> None:
+        if self._active_reset_id is None:
+            raise RuntimeError("Cannot start an episode before starting a reset attempt.")
         initial_state_pkl = self._to_pickleable(initial_state)
         self._active_episode = {
             "episode_index": len(self._episodes),
             "episode_name": f"demo_{len(self._episodes)}",
+            "reset_id": self._active_reset_id,
             "initial_state": initial_state_pkl,
             "goal_pose": self._to_pickleable(goal_pose) if goal_pose is not None else None,
             "actions": [],
             "success": None,
         }
+        if task_state:
+            self._active_episode["task_state"] = self._to_pickleable(task_state)
         if self._record_state:
             # ``states`` always stores T+1 snapshots: initial state + one state per action step.
             self._active_episode["states"] = [initial_state_pkl]
+        if self._record_arm_joint_actions:
+            self._active_episode["arm_joint_actions"] = []
         if multi_assets is not None:
             self._active_episode["multi_assets"] = self._to_pickleable(multi_assets)
         if multi_usds is not None:
@@ -318,6 +462,22 @@ class TrajectoryPickleRecorder:
         if self._active_episode is None:
             return
         self._active_episode["actions"].append(self._to_pickleable(action))
+
+    def record_arm_joint_action(self, joint_pos_target) -> None:
+        """Record the post-step commanded arm joint targets (``joint_pos_target``).
+
+        This is separate from ``actions`` because the recorded action for
+        IK-controlled arms (e.g. FR3+Sharpa) is an absolute EE pose, not raw
+        joint targets. This field captures what the IK solve actually
+        commanded to the simulation for the arm joints, indexed per
+        ``arm_joint_names``.
+        """
+        if not self._record_arm_joint_actions or self._active_episode is None:
+            return
+        arm_joint_actions = self._active_episode.get("arm_joint_actions")
+        if not isinstance(arm_joint_actions, list):
+            return
+        arm_joint_actions.append(self._to_pickleable(joint_pos_target))
 
     def record_state(self, state) -> None:
         if not self._record_state or self._active_episode is None:
@@ -337,6 +497,19 @@ class TrajectoryPickleRecorder:
         else:
             self._active_episode["actions"] = np.zeros((0, 0), dtype=np.float32)
         self._active_episode["num_steps"] = int(self._active_episode["actions"].shape[0])
+        if self._record_arm_joint_actions:
+            arm_joint_actions = self._active_episode["arm_joint_actions"]
+            if len(arm_joint_actions) > 0:
+                stacked_arm = np.stack([np.asarray(a).reshape(-1) for a in arm_joint_actions], axis=0)
+                self._active_episode["arm_joint_actions"] = stacked_arm.astype(np.float32, copy=False)
+            else:
+                self._active_episode["arm_joint_actions"] = np.zeros((0, len(self._arm_joint_names)), dtype=np.float32)
+            if self._active_episode["arm_joint_actions"].shape[0] != self._active_episode["num_steps"]:
+                raise ValueError(
+                    "arm_joint_actions length mismatch: got "
+                    f"{self._active_episode['arm_joint_actions'].shape[0]}, expected "
+                    f"{self._active_episode['num_steps']}."
+                )
         if self._record_state:
             states = self._active_episode.get("states")
             if not isinstance(states, list):
@@ -348,8 +521,16 @@ class TrajectoryPickleRecorder:
                     "(must be T+1: initial + per-step post-state)."
                 )
         self._active_episode["success"] = bool(success)
+        episode_index = int(self._active_episode["episode_index"])
+        num_steps = int(self._active_episode["num_steps"])
         self._episodes.append(self._active_episode)
         self._active_episode = None
+        self._finalize_reset_attempt(
+            "success" if success else "failed",
+            reason="success" if success else "finalized_failure",
+            num_steps=num_steps,
+            successful_episode_index=episode_index if success else None,
+        )
         self.flush()
 
     def discard_episode(self) -> None:
@@ -359,6 +540,8 @@ class TrajectoryPickleRecorder:
         payload = dict(self._metadata)
         payload["num_episodes"] = len(self._episodes)
         payload["episodes"] = self._episodes
+        payload["num_reset_attempts"] = len(self._reset_attempts)
+        payload["reset_attempts"] = self._reset_attempts
         with open(self._output_file, "wb") as fp:
             pickle.dump(payload, fp, protocol=pickle.HIGHEST_PROTOCOL)
 
@@ -377,15 +560,16 @@ class TrajectoryPickleRecorder:
         return data
 
 
-def _get_goal_pose_from_env(env) -> torch.Tensor | None:
-    """Read the current goal pose command, if the task defines one."""
-    if not hasattr(env, "command_manager"):
-        return None
-    try:
-        goal_pose = env.command_manager.get_command("object_pose")
-    except (AttributeError, KeyError):
-        return None
-    return goal_pose[0].detach().clone()
+def _get_goal_pose_from_task_state(task_state: dict) -> torch.Tensor | None:
+    """Return the legacy single goal pose from the richer task-state snapshot."""
+    commands = task_state.get("commands", {})
+    ordered_names = ["object_pose", *(name for name in commands if name != "object_pose")]
+    for name in ordered_names:
+        buffers = commands.get(name, {})
+        pose = buffers.get("pose_command_b")
+        if isinstance(pose, torch.Tensor) and pose.numel() == 7:
+            return pose.detach().clone()
+    return None
 
 
 def _get_active_object_metadata_from_env(env, env_index: int = 0) -> dict | None:
@@ -624,7 +808,7 @@ def create_environment_config() -> tuple["ManagerBasedRLEnvCfg | DirectRLEnvCfg"
     try:
         env_cfg = parse_env_cfg(args_cli.task, device=args_cli.device, num_envs=1, json_path=args_cli.json_path)
     except Exception as e:
-        logger.error(f"Failed to parse environment configuration: {e}")
+        logger.exception(f"Failed to parse environment configuration: {e}")
         exit(1)
 
     override_kwargs: dict = {}
@@ -650,6 +834,14 @@ def create_environment_config() -> tuple["ManagerBasedRLEnvCfg | DirectRLEnvCfg"
         env_cfg.sim.device = args_cli.device if args_cli.device is not None else env_cfg.sim.device
         env_cfg.scene.num_envs = 1
     env_cfg.env_name = args_cli.task.split(":")[-1]
+
+    # Must come after the cfg_cls(**override_kwargs) rebuild above, which would
+    # otherwise reset the seed to the task default (42). ManagerBasedEnv consumes
+    # cfg.seed before scene construction, seeding python/numpy/torch/warp, so it
+    # also governs multi-asset/multi-USD random.choice spawn picks. A value of -1
+    # is resolved to a randomly drawn seed and written back into cfg.seed.
+    if args_cli.seed is not None:
+        env_cfg.seed = args_cli.seed
 
     if "TopDownGrasp" in args_cli.task or "Lift" in args_cli.task:
         if hasattr(env_cfg, "commands") and hasattr(env_cfg.commands, "object_pose"):
@@ -689,6 +881,7 @@ def create_environment_config() -> tuple["ManagerBasedRLEnvCfg | DirectRLEnvCfg"
         )
         apply_teleop_retargeting_scheme(env_cfg.teleop_devices, args_cli.retargeting_scheme)
 
+    configure_v1_debug_visualization(env_cfg, cues_in_rgb=args_cli.cues_in_rgb)
     return env_cfg, success_term
 
 
@@ -701,7 +894,7 @@ def create_environment(
                 return gym.make(args_cli.task, cfg=env_cfg).unwrapped
         return gym.make(args_cli.task, cfg=env_cfg).unwrapped
     except Exception as e:
-        logger.error(f"Failed to create environment: {e}")
+        logger.exception(f"Failed to create environment: {e}")
         exit(1)
 
 
@@ -787,15 +980,19 @@ def run_simulation_loop(
     trajectory_recorder: TrajectoryPickleRecorder,
     multi_assets: list[dict] | None = None,
     multi_usds: list[dict] | None = None,
+    arm_joint_ids: list[int] | None = None,
+    stats_panel: object | None = None,
 ) -> int:
     success_step_count = 0
     should_reset = False
     should_quit = False
+    reset_reason = "manual_reset"
     running = False  # Start inactive for VR (user activates with START gesture).
 
     def reset_recording_instance():
-        nonlocal should_reset
+        nonlocal should_reset, reset_reason
         should_reset = True
+        reset_reason = "manual_reset"
         print("Recording instance reset requested")
 
     def start_recording_instance():
@@ -829,7 +1026,9 @@ def run_simulation_loop(
 
     env.sim.reset()
     env.reset()
+    first_reset_id = trajectory_recorder.start_reset_attempt()
     teleop_interface.reset()
+    print(f"Reset ID: {first_reset_id}")
 
     print("=" * 60)
     print("VR Demo Recording Started")
@@ -838,6 +1037,8 @@ def run_simulation_loop(
     print(f"Teleop Device: {args_cli.teleop_device}")
     print(f"Trajectory pickle: {args_cli.dataset_file}")
     print(f"Record per-step states: {args_cli.record_state}")
+    print(f"Environment seed: {getattr(env_cfg, 'seed', None)}")
+    print(f"Physics simulation device: {env.device}")
     print(f"Target Demos: {'Infinite' if args_cli.num_demos == 0 else args_cli.num_demos}")
     print("=" * 60)
     print("\nVR Controls:")
@@ -894,13 +1095,30 @@ def run_simulation_loop(
                     pass
 
             action = teleop_interface.advance()
+            # RESET callbacks fire during ``advance``. Honor them before taking
+            # another action so an untouched setup is correctly logged as
+            # skipped rather than as a one-step failed attempt.
+            if should_reset:
+                outcome = trajectory_recorder.finish_reset_without_success(reason=reset_reason)
+                if outcome is not None:
+                    print(f"Reset attempt recorded as {outcome}.")
+                handle_reset(env)
+                next_reset_id = trajectory_recorder.start_reset_attempt()
+                teleop_interface.reset()
+                print(f"Reset ID: {next_reset_id}")
+                success_step_count = 0
+                should_reset = False
+                running = False
+                continue
             if running:
                 # On the first step of a new demo, capture the initial scene state.
                 if not trajectory_recorder.has_active_episode():
                     initial_scene_state = env.scene.get_state(is_relative=True)
+                    task_state = capture_episode_task_state(env)
                     trajectory_recorder.start_episode(
                         initial_state=initial_scene_state,
-                        goal_pose=_get_goal_pose_from_env(env),
+                        goal_pose=_get_goal_pose_from_task_state(task_state),
+                        task_state=task_state,
                         multi_assets=multi_assets,
                         multi_usds=multi_usds,
                         active_object_metadata=_get_active_object_metadata_from_env(env),
@@ -908,16 +1126,41 @@ def run_simulation_loop(
 
                 trajectory_recorder.record_action(action.detach().clone())
                 actions = action.repeat(env.num_envs, 1)
-                env.step(actions)
+                step_output = env.step(actions)
+                terminated = step_output[2]
+                truncated = step_output[3]
+                episode_done = bool(torch.logical_or(terminated, truncated)[0])
+                if episode_done:
+                    outcome = trajectory_recorder.finish_reset_without_success(reason="environment_termination")
+                    next_reset_id = trajectory_recorder.start_reset_attempt()
+                    teleop_interface.reset()
+                    success_step_count = 0
+                    should_reset = False
+                    running = False
+                    print(f"✗ Reset attempt recorded as {outcome}; auto-reset ID: {next_reset_id}")
+                    continue
                 if args_cli.record_state:
                     post_step_state = env.scene.get_state(is_relative=True)
                     trajectory_recorder.record_state(post_step_state)
+                if arm_joint_ids is not None:
+                    robot = env.scene["robot"]
+                    arm_joint_pos_target = robot.data.joint_pos_target[0, arm_joint_ids]
+                    trajectory_recorder.record_arm_joint_action(arm_joint_pos_target.detach().clone())
 
                 success_step_count, success_reached = check_success(env, success_term, success_step_count)
                 if success_reached:
+                    successful_reset_id = trajectory_recorder.current_reset_id
                     trajectory_recorder.finalize_episode(success=True)
-                    print(f"✓ Recorded {trajectory_recorder.num_episodes} successful demonstration(s).")
+                    print(
+                        f"✓ Recorded {trajectory_recorder.num_episodes} successful demonstration(s) "
+                        f"from reset ID {successful_reset_id}."
+                    )
+                    if stats_panel is not None:
+                        # ~110 ms (score + render), spent in the pause before the
+                        # reset, so the operator never feels it.
+                        stats_panel.publish(trajectory_recorder.episodes)
                     should_reset = True
+                    reset_reason = "after_success"
                     running = False
 
                 if args_cli.num_demos > 0 and trajectory_recorder.num_episodes >= args_cli.num_demos:
@@ -930,10 +1173,13 @@ def run_simulation_loop(
                 env.sim.render()
 
             if should_reset:
-                if trajectory_recorder.has_active_episode():
-                    trajectory_recorder.discard_episode()
+                outcome = trajectory_recorder.finish_reset_without_success(reason=reset_reason)
+                if outcome is not None:
+                    print(f"Reset attempt recorded as {outcome}.")
                 handle_reset(env)
+                next_reset_id = trajectory_recorder.start_reset_attempt()
                 teleop_interface.reset()
+                print(f"Reset ID: {next_reset_id}")
                 success_step_count = 0
                 should_reset = False
                 running = False
@@ -941,7 +1187,28 @@ def run_simulation_loop(
             if env.sim.is_stopped():
                 break
 
+    outcome = trajectory_recorder.finish_reset_without_success(reason="session_ended")
+    if outcome is not None:
+        print(f"Final reset attempt recorded as {outcome}.")
     return trajectory_recorder.num_episodes
+
+
+def _resolve_arm_joint_ids(env: gym.Env, env_cfg) -> tuple[list[int] | None, list[str] | None]:
+    """Resolve arm joint indices + names from ``env_cfg.robot_config.arm_joint_names_expr``.
+
+    Returns ``(None, None)`` if the task has no ``robot_config`` or no arm
+    joint expression configured (e.g. floating hand-only embodiments with no
+    separate arm).
+    """
+    robot_config = getattr(env_cfg, "robot_config", None)
+    arm_joint_names_expr = getattr(robot_config, "arm_joint_names_expr", None) if robot_config else None
+    if not arm_joint_names_expr:
+        return None, None
+    robot = env.scene["robot"]
+    joint_ids, joint_names = robot.find_joints(arm_joint_names_expr, preserve_order=True)
+    if not joint_ids:
+        return None, None
+    return joint_ids, joint_names
 
 
 def main() -> None:
@@ -953,8 +1220,19 @@ def main() -> None:
     multi_spawn_catalogs = _collect_multi_spawn_catalogs(env_cfg.scene)
     multi_spawn_trace = MultiSpawnTrace(multi_spawn_catalogs)
 
+    if args_cli.show_ranges:
+        # Must happen before create_environment: the term is registered on the
+        # cfg and instantiated when the observation manager is built.
+        from dexverse.teleop_utils.range_vis import attach_range_vis
+
+        attach_range_vis(env_cfg)
+
     env = create_environment(env_cfg, multi_spawn_trace=multi_spawn_trace)
     teleop_interface = setup_teleop_device(env_cfg, {})
+
+    arm_joint_ids, arm_joint_names = _resolve_arm_joint_ids(env, env_cfg)
+    if arm_joint_names is not None:
+        logger.info(f"Recording arm_joint_actions for joints: {arm_joint_names}")
 
     trajectory_recorder = TrajectoryPickleRecorder(
         output_file,
@@ -964,7 +1242,25 @@ def main() -> None:
         usd_path=getattr(env_cfg, "usd_path", None),
         robot_type=getattr(env_cfg, "robot_type", None),
         json_path=args_cli.json_path,
+        arm_joint_names=arm_joint_names,
+        # Read after create_environment so a -1 request has been resolved to the
+        # actually drawn seed (ManagerBasedEnv writes it back into cfg.seed).
+        seed=getattr(env_cfg, "seed", None),
+        action_layout_metadata=action_layout(env),
+        sim_device=str(env.device),
     )
+
+    stats_panel = None
+    if args_cli.show_stats:
+        from dexverse.teleop_utils.stats_panel import TeleopStatsPanel
+
+        stats_panel = TeleopStatsPanel(
+            task=args_cli.task,
+            robot_type=getattr(env_cfg, "robot_type", None),
+            session_file=output_file,
+            include_history=args_cli.stats_history,
+            xr=bool(getattr(args_cli, "xr", False)),
+        )
 
     episode_multi_assets = multi_spawn_trace.multi_assets if multi_spawn_trace.multi_assets else None
     episode_multi_usds = multi_spawn_trace.multi_usds if multi_spawn_trace.multi_usds else None
@@ -975,8 +1271,12 @@ def main() -> None:
         trajectory_recorder,
         multi_assets=episode_multi_assets,
         multi_usds=episode_multi_usds,
+        arm_joint_ids=arm_joint_ids,
+        stats_panel=stats_panel,
     )
 
+    if stats_panel is not None:
+        stats_panel.close()
     env.close()
     trajectory_recorder.flush()
     print(f"\nRecording session completed with {num_recorded} successful demonstration(s)")
