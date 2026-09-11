@@ -39,10 +39,9 @@ setup(
     install_requires=INSTALL_REQUIRES,
     license="BSD-3-Clause",
     include_package_data=True,
-    python_requires=">=3.10",
+    python_requires=">=3.11",
     classifiers=[
         "Natural Language :: English",
-        "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.11",
         "Isaac Sim :: 4.5.0",
         "Isaac Sim :: 5.0.0",

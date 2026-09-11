@@ -98,6 +98,12 @@ class SimpleRelativeRetargeter(RetargeterBase):
     def __init__(self, cfg: SimpleRelativeRetargeterCfg):
         super().__init__(cfg)
         self.cfg = cfg
+        self._debug_visualization_enabled = cfg.task_version != 1 or cfg.debug_vis
+        # Preserve original marker semantics for v0 while honoring v1's cue switch.
+        if cfg.task_version == 1:
+            from dexverse.baseline_v1.visual_purpose import hide_marker_from_cameras as hide_task_marker
+        else:
+            hide_task_marker = hide_marker_from_cameras
         self._layout = self._get_action_layout(cfg.robot_type)
         self._tracked_hands = tuple(self._layout["hands"].keys())
         self._bound_hand = cfg.bound_hand
@@ -115,6 +121,11 @@ class SimpleRelativeRetargeter(RetargeterBase):
 
         self.latest_wrist_poses = {hand: None for hand in self._tracked_hands}
         self.retarget_base_wrist_poses = {hand: _default_wrist_pose() for hand in self._tracked_hands}
+        # Continuous Euler history for joint-controlled floating wrists. This
+        # prevents the principal-angle +pi -> -pi branch change from becoming
+        # a full-revolution absolute joint command before configured limits are
+        # applied.
+        self._previous_wrist_euler_commands = {hand: None for hand in self._tracked_hands}
         self._dex_retgt = {}
         self._dex_output_joint_names = {}
         self._dex_to_action_finger_indices = {}
@@ -134,8 +145,8 @@ class SimpleRelativeRetargeter(RetargeterBase):
             },
         )
         self._markers = VisualizationMarkers(point_marker_cfg)
-        hide_marker_from_cameras(self._markers)
-        self._markers.set_visibility(True)
+        hide_task_marker(self._markers)
+        self._markers.set_visibility(self._debug_visualization_enabled)
 
         canonical_point_marker_cfg = VisualizationMarkersCfg(
             prim_path="/Visuals/simple_relative_canonical_hand_keypoints",
@@ -147,16 +158,16 @@ class SimpleRelativeRetargeter(RetargeterBase):
             },
         )
         self._canonical_markers = VisualizationMarkers(canonical_point_marker_cfg)
-        hide_marker_from_cameras(self._canonical_markers)
-        self._canonical_markers.set_visibility(True)
+        hide_task_marker(self._canonical_markers)
+        self._canonical_markers.set_visibility(self._debug_visualization_enabled)
 
         wrist_frame_cfg = FRAME_MARKER_CFG.copy()
         wrist_frame_cfg.markers["frame"].scale = (0.1, 0.1, 0.1)
         self._wrist_markers = VisualizationMarkers(
             wrist_frame_cfg.replace(prim_path="/Visuals/simple_relative_wrist_frames")
         )
-        hide_marker_from_cameras(self._wrist_markers)
-        self._wrist_markers.set_visibility(True)
+        hide_task_marker(self._wrist_markers)
+        self._wrist_markers.set_visibility(self._debug_visualization_enabled)
 
         if cfg.initialize_dex_retargeting:
             self._initialize_dex_retargeters()
@@ -198,6 +209,7 @@ class SimpleRelativeRetargeter(RetargeterBase):
                 missing_hands.append(hand.name)
                 continue
             self.retarget_base_wrist_poses[hand] = wrist_pose.copy()
+            self._previous_wrist_euler_commands[hand] = None
             calibrated_hands.append(hand.name)
 
         if not calibrated_hands:
@@ -224,6 +236,10 @@ class SimpleRelativeRetargeter(RetargeterBase):
         module_name, attr_name = SIMPLE_RETARGETER_LAYOUT_SOURCES[robot_type]
         module = import_module(module_name)
         raw_layout = getattr(module, attr_name)
+        if self.cfg.task_version == 1 and module_name == "dexverse.robot_agents.shadow.floating":
+            from dexverse.baseline_v1.control_profile import action_layout
+
+            raw_layout = action_layout(raw_layout)
 
         hands = {}
         for hand_name, hand_layout in raw_layout["hands"].items():
@@ -309,6 +325,10 @@ class SimpleRelativeRetargeter(RetargeterBase):
         if "retargeting" not in config:
             raise ValueError(f"Invalid dex-retargeting config '{config_path}': missing 'retargeting' section.")
 
+        if self.cfg.task_version == 1 and self._get_robot_module().__name__ == "dexverse.robot_agents.shadow.floating":
+            from dexverse.baseline_v1.control_profile import retargeting_config
+
+            config = retargeting_config(config, getattr(self.cfg, "retargeting_scheme", "dexpilot"))
         config["retargeting"]["urdf_path"] = urdf_path
 
         with tempfile.NamedTemporaryFile(mode="w", suffix=".yml", delete=False) as temp_file:
@@ -458,8 +478,41 @@ class SimpleRelativeRetargeter(RetargeterBase):
             raise ValueError(f"Unsupported wrist_rot_repr '{rot_repr}'. Use 'euler', 'rotvec', or 'quat_absolute'.")
         rot_signs = np.asarray(hand_layout.get("wrist_rot_signs", (1.0, 1.0, 1.0)), dtype=np.float32)
         relative_rot_cmd = relative_rot_cmd * rot_signs
+        if rot_repr == "euler" and self.cfg.task_version == 1:
+            relative_rot_cmd = self._unwrap_and_clip_wrist_euler(relative_rot_cmd, hand, hand_layout)
         self._assign(action, hand_layout["wrist_trans_indices"], wrist_abs_pos_cmd)
         self._assign(action, hand_layout["wrist_rot_indices"], relative_rot_cmd)
+
+    def _unwrap_and_clip_wrist_euler(
+        self,
+        command: np.ndarray,
+        hand: DeviceBase.TrackingTarget,
+        hand_layout: dict[str, Any],
+    ) -> np.ndarray:
+        """Choose the continuous Euler branch, then apply optional joint limits.
+
+        ``Rotation.as_euler`` returns principal angles, so a smooth physical
+        motion can jump numerically from +pi to -pi. Absolute joint controllers
+        interpret that as a nearly full-revolution target change. Unwrapping
+        first makes clipping stable at a limit instead of alternating between
+        the positive and negative limits.
+        """
+        current = np.asarray(command, dtype=np.float32).reshape(-1)
+        previous = self._previous_wrist_euler_commands.get(hand)
+        if isinstance(previous, np.ndarray) and previous.shape == current.shape:
+            delta = (current - previous + np.pi) % (2.0 * np.pi) - np.pi
+            current = previous + delta
+        self._previous_wrist_euler_commands[hand] = current.copy()
+
+        limits = hand_layout.get("wrist_euler_limits")
+        if limits is None:
+            return current
+        limits_array = np.asarray(limits, dtype=np.float32)
+        if limits_array.shape != (current.size, 2):
+            raise ValueError(
+                f"wrist_euler_limits must have shape ({current.size}, 2), got {limits_array.shape}."
+            )
+        return np.clip(current, limits_array[:, 0], limits_array[:, 1]).astype(np.float32, copy=False)
 
     def _assign_absolute_wrist_command(
         self,
@@ -671,6 +724,8 @@ class SimpleRelativeRetargeter(RetargeterBase):
 
     def _visualize_hand_keypoints(self, hand_data_by_target: dict[DeviceBase.TrackingTarget, Any]) -> None:
         """Visualize the current hand keypoints as small spheres."""
+        if not self._debug_visualization_enabled:
+            return
         joint_positions = []
         for hand_data in hand_data_by_target.values():
             if not isinstance(hand_data, dict):
@@ -690,6 +745,8 @@ class SimpleRelativeRetargeter(RetargeterBase):
         hand_data_by_target: dict[DeviceBase.TrackingTarget, Any],
     ) -> None:
         """Visualize canonicalized hand joints, translated back to the wrist position."""
+        if not self._debug_visualization_enabled:
+            return
         canonical_joint_positions_world = []
         for hand, hand_data in hand_data_by_target.items():
             if not isinstance(hand_data, dict):
@@ -712,6 +769,8 @@ class SimpleRelativeRetargeter(RetargeterBase):
 
     def _visualize_wrist_poses(self) -> None:
         """Visualize tracked wrist poses as frame markers."""
+        if not self._debug_visualization_enabled:
+            return
         wrist_positions = []
         wrist_orientations = []
         for hand in self._tracked_hands:
@@ -774,4 +833,8 @@ class SimpleRelativeRetargeterCfg(RetargeterCfg):
     default_command: tuple[float, ...] = field(default_factory=tuple)
     finger_scales: dict[str, float] = field(default_factory=dict)
     retargeting_scheme: str = "dexpilot"
+    task_version: int = 0
+    """Use v1 wrist continuity/vector settings only for explicitly upgraded tasks."""
+    debug_vis: bool = True
+    """v1 follows the task debug switch; v0 ignores this field to preserve its visuals."""
     retargeter_type: type[RetargeterBase] = SimpleRelativeRetargeter

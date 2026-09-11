@@ -19,6 +19,7 @@ import argparse
 from collections.abc import Callable
 
 from isaaclab.app import AppLauncher
+from dexverse.teleop_utils.debug_visualization import add_debug_visualization_args, configure_v1_debug_visualization
 
 # add argparse arguments
 parser = argparse.ArgumentParser(description="Teleoperation for DexVerse environments.")
@@ -34,12 +35,17 @@ parser.add_argument(
 )
 parser.add_argument("--task", type=str, default=None, help="Name of the task.")
 parser.add_argument(
+    "--seed", type=int, default=None,
+    help="Environment randomization seed; omitted keeps the task default, -1 draws a random seed.",
+)
+parser.add_argument(
     "--robot_type",
     type=str,
     default=None,
     help=(
-        "Optional robot variant override for environments that expose 'robot_type' "
-        "(floating_shadow_right, floating_shadow_left, floating_shadow_bimanual)."
+        "Optional robot variant override for environments that expose 'robot_type'. "
+        "Supported variants: floating_shadow_right, floating_shadow_left, "
+        "floating_shadow_bimanual."
     ),
 )
 parser.add_argument(
@@ -87,18 +93,26 @@ parser.add_argument(
     default=False,
     help="Enable Pinocchio (required for dex-retargeting and some IK controllers).",
 )
+add_debug_visualization_args(parser, teleop=True)
 parser.add_argument(
-    "--enable_debug_vis",
-    action=argparse.BooleanOptionalAction,
-    default=None,
+    "--show_ranges",
+    action="store_true",
+    default=False,
     help=(
-        "Override the task's debug-visualization toggle (zone / reference-point "
-        "markers). Use --enable_debug_vis to force on, --no-enable_debug_vis to "
-        "force off; omit to use the task's default."
+        "Outline the task's randomization ranges -- object spawn envelopes and "
+        "goal sampling boxes -- as wireframe boxes, so the operator can see the "
+        "space the task samples from instead of inferring it one episode at a "
+        "time. Operator-only: the markers are tagged purpose=guide and stay out "
+        "of recorded camera observations."
     ),
 )
 # append AppLauncher cli args
 AppLauncher.add_app_launcher_args(parser)
+# Live teleoperation favors latency over image quality. Isaac Lab's supported
+# performance preset disables expensive reflections / indirect lighting /
+# ambient occlusion / denoisers and uses DLSS Performance. A caller can still
+# override this with ``--rendering_mode balanced`` or ``quality``.
+parser.set_defaults(rendering_mode="performance")
 # parse the arguments
 args_cli, unknown_args = parser.parse_known_args()
 
@@ -247,7 +261,18 @@ def main() -> None:  # noqa: C901
         if args_cli.num_envs is not None:
             env_cfg.scene.num_envs = args_cli.num_envs
     _apply_hydra_env_overrides(env_cfg, hydra_env_overrides)
+    # Apply after the config rebuild and Hydra overrides, before scene spawning.
+    # An explicit CLI seed wins; omission preserves env.seed/task defaults.
+    if args_cli.seed is not None:
+        env_cfg.seed = args_cli.seed
     env_cfg.env_name = args_cli.task
+
+    if args_cli.show_ranges:
+        # Registered as a scene_vis observation term, which observation presets
+        # never null out, so the overlay survives whichever preset the task picks.
+        from dexverse.teleop_utils.range_vis import attach_range_vis
+
+        attach_range_vis(env_cfg)
 
     # Swap retargeter cfgs in place after the per-task __post_init__ has
     # fully built env_cfg.teleop_devices. Keeping this out of the env cfg
@@ -260,6 +285,7 @@ def main() -> None:  # noqa: C901
         )
         apply_teleop_retargeting_scheme(env_cfg.teleop_devices, args_cli.retargeting_scheme)
 
+    configure_v1_debug_visualization(env_cfg, cues_in_rgb=args_cli.cues_in_rgb)
     # Template environments consume json_path internally via parse_env_cfg.
 
     # modify configuration
@@ -297,6 +323,7 @@ def main() -> None:  # noqa: C901
     try:
         # create environment
         env = gym.make(args_cli.task, cfg=env_cfg).unwrapped
+        print(f"[teleop] Environment seed: {env.cfg.seed}")
         # check environment name (for reach, we don't allow the gripper)
         if "Reach" in args_cli.task:
             logger.warning(
@@ -304,7 +331,7 @@ def main() -> None:  # noqa: C901
                 " ignored."
             )
     except Exception as e:
-        logger.error(f"Failed to create environment: {e}")
+        logger.exception(f"Failed to create environment: {e}")
         simulation_app.close()
         return
 
@@ -489,8 +516,8 @@ def main() -> None:  # noqa: C901
                     should_reset_recording_instance = False
                     print("Environment reset complete")
 
-        except Exception as e:
-            logger.error(f"Error during simulation step: {e}")
+        except Exception:
+            logger.exception("Error during simulation step")
             break
 
     # close the simulator
