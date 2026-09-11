@@ -5,6 +5,7 @@
 
 """Imitation-learning baselines for DexVerse.
 
-``diffusion`` is the state-based Diffusion Policy baseline. See
-``scripts/diffusion/`` for the entry points.
+``diffusion`` provides state-based Diffusion Policy; ``dp3`` provides
+point-cloud-conditioned 3D Diffusion Policy. Entry points live in
+``scripts/diffusion/`` and ``scripts/dp3/``, respectively.
 """

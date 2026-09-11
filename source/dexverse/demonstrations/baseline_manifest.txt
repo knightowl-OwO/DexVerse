@@ -1,32 +1,21 @@
-# Curated baseline demonstration set: the 19 tasks the Diffusion Policy
-# baseline in scripts/diffusion/ is trained and evaluated on. 50 successful
-# teleoperated episodes per task (53 for SlideUtilityKnife and SqueezeScissors),
-# all recorded with the floating Shadow hand.
-#
-# Each line is a <category>/<task> path under the `demonstrations/` prefix of the
-# Hugging Face dataset -- the task's real location, not a separate "baseline"
-# copy, so `download_demos.py --all` does not re-fetch what --baseline already
-# got. Read by scripts/demo_tools/download_demos.py --baseline and
-# scripts/demo_tools/upload_demos.py --baseline.
-#
-#   python scripts/demo_tools/download_demos.py --baseline
-
-articulation/Dexverse-OpenFaucet-v0
-articulation/Dexverse-OpenFlatFolder-v0
-articulation/Dexverse-OpenLaptop-v0
-articulation/Dexverse-OpenStapler-v0
-articulation/Dexverse-SlideUtilityKnife-v0
-articulation/Dexverse-SqueezeScissors-v0
-bimanual/Dexverse-BimanualLiftCarton-v0
-bimanual/Dexverse-BimanualLiftTray-v0
-contact_rich/Dexverse-InsertPen-v0
-functional/Dexverse-FunctionalHammerStrike-v0
+# Original v0 baseline task listing. See baseline_manifest_v1.txt for upgrades.
+functional/Dexverse-GraspBleach-v0
+functional/Dexverse-GraspPan-v0
+functional/Dexverse-GraspKettle-v0
+functional/Dexverse-GraspCup-v0
+functional/Dexverse-RemoveCupFromRack-v0
 functional/Dexverse-FunctionalPourCan-v0
 functional/Dexverse-FunctionalPourMug-v0
-functional/Dexverse-GraspBleach-v0
-functional/Dexverse-GraspCup-v0
-functional/Dexverse-GraspKettle-v0
-functional/Dexverse-GraspPan-v0
-functional/Dexverse-RemoveCupFromRack-v0
+functional/Dexverse-FunctionalHammerStrike-v0
+articulation/Dexverse-OpenFaucet-v0
+articulation/Dexverse-OpenDoor-v0
+articulation/Dexverse-OpenLaptop-v0
+articulation/Dexverse-SqueezeScissors-v0
+articulation/Dexverse-SlideUtilityKnife-v0
+articulation/Dexverse-OpenStapler-v0
+articulation/Dexverse-OpenFlatFolder-v0
+bimanual/Dexverse-BimanualLiftTray-v0
+bimanual/Dexverse-BimanualLiftCarton-v0
+contact_rich/Dexverse-InsertPen-v0
 non_prehensile/Dexverse-PushSmallSphereObstacleSlope-v0
 non_prehensile/Dexverse-PushT-v0
