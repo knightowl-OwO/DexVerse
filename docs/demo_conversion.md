@@ -1,5 +1,8 @@
 # Download demonstrations and convert to H5
 
+For commands that continue from H5 conversion through DP/DP3 dataset preparation,
+training, and online evaluation, see [Train and run DP and DP3](baseline_training.md).
+
 Run from the DexVerse checkout installed in your `dexverse` environment, using
 NumPy 1.26 and the task's assets. Only load trusted pickles. Isaac Sim requires a
 supported NVIDIA GPU for startup/rendering even when physics uses CPU.

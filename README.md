@@ -22,7 +22,9 @@
 
 - [x] Initial release: task suite, assets
 - [x] Release teleoperation and data-collection tooling and corresponding documentations
-- [x] Baseline environment demonstrations and baseline code
+- [x] Upgraded baseline tasks (`-v1`), alongside the original `-v0` tasks
+- [ ] State-based Diffusion Policy (DP) and point-cloud DP3 training and evaluation
+- [ ] Pi0.5 VLA baseline
 - [ ] Full shadowhand demonstration dataset
 - [ ] Cross-embodiment robot assets, instructions, and demonstrations
 
@@ -30,7 +32,10 @@
 
 This repository is the official codebase for **DexVerse**, a benchmark for tabletop dexterous
 manipulation built on [Isaac Lab](https://github.com/isaac-sim/IsaacLab). 
-See [demo download and H5 conversion](docs/demo_conversion.md), or run
+The `develop` branch includes the upgraded baseline tasks, demonstration tools,
+and initial DP/DP3 baseline implementations. Start with the [DP and DP3 walkthrough](docs/baseline_training.md)
+for demo preparation, dataset conversion, training, and a short policy rollout.
+See [demo download and H5 conversion](docs/demo_conversion.md) for more selection options, or run
 `python scripts/list_envs.py` for the registered task catalog.
 
 ## Repository Structure
@@ -121,7 +126,15 @@ sudo apt install cmake build-essential   # Linux system dependencies
 
 ### Install the DexVerse package
 
-Most dependencies will be satisfied after IsaacLab installation. After IsaacLab is fully installed, from this repository root and in the same virtual environment that IsaacLab is installed to, install the extension (optionally in editable mode):
+After installing Isaac Lab, clone `develop` to use the upgraded tasks and both
+baselines. Run this from the parent directory containing `IsaacLab/`:
+
+```bash
+git clone --branch develop https://github.com/ycyao216/DexVerse.git
+cd DexVerse
+```
+
+Most dependencies will be satisfied after IsaacLab installation. From this repository root and in the same virtual environment that IsaacLab is installed to, install the extension (optionally in editable mode):
 
 ```bash
 python -m pip install -e source/dexverse
@@ -377,8 +390,7 @@ python scripts/demo_tools/create_demo_files_sequential.py \
 
 Pass `--no-set-state` only if you explicitly want true action replay. See `create_demo_files_sequential.py --help` for the full set of output and selection options.
 
-For curated baseline demos, select the task **including its version**. Once the
-versioned release is available in the dataset repository:
+For curated baseline demos, select the task **including its version**:
 
 ```bash
 # Download all available v0 AND v1 baselines (reports missing sets).
@@ -485,6 +497,9 @@ python scripts/demo_tools/download_demos.py --baseline
 
 ## Imitation-Learning Baselines
 
+DP/DP3 training and evaluation are still in progress. The walkthrough below
+provides commands for initial pipeline checks.
+
 State-based [Diffusion Policy](https://diffusion-policy.cs.columbia.edu/) lives in
 `dexverse.IL.diffusion`, with entry points in `scripts/diffusion/`.
 [DP3](source/dexverse/dexverse/IL/dp3/README.md) uses point clouds and proprioception,
@@ -494,12 +509,19 @@ with entry points in `scripts/dp3/`. Install their optional dependencies with:
 python -m pip install -e "source/dexverse[dp3]"
 ```
 
-First convert a versioned task's demonstrations with
-`scripts/demo_tools/create_demo_files_sequential.py`: use `--obs-groups state`
-for DP or `--obs-groups pointcloud` for DP3. Then build the training dataset
-with `scripts/diffusion/build_dataset.py` or `scripts/dp3/convert_demos_to_dp3.py`,
-respectively. Each baseline provides `train.py` and `eval_online.py`; see their
-`--help` output for arguments.
+Follow the **[DP and DP3 walkthrough](docs/baseline_training.md)** to download
+50 PushT v1 demonstrations, generate observation H5s, build both training
+datasets, train for two epochs, and load each checkpoint for a short simulator
+rollout. It includes commands and the output files to check at each stage.
+
+| Baseline | Replay preset (`--obs-groups`) | Build the training dataset | Train / evaluate |
+| --- | --- | --- | --- |
+| DP | `state` | `scripts/diffusion/build_dataset.py` | `scripts/diffusion/train.py` / `eval_online.py` |
+| DP3 | `pointcloud` | `scripts/dp3/convert_demos_to_dp3.py` | `scripts/dp3/train.py` / `eval_online.py` |
+
+The walkthrough uses CPU physics for conversion and evaluation, and CUDA for
+neural-network training. Two epochs check that the pipeline runs; longer
+training and evaluation are needed to assess task success.
 
 Keep the task version and observation preset consistent through conversion,
 training, and evaluation. The state converter records observation-term order so

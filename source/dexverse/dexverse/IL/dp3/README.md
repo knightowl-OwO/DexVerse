@@ -73,14 +73,18 @@ python -m pip install matplotlib pillow
 
 ## End-to-End Usage
 
+For a short test using 50 PushT v1 demonstrations and two training epochs, see
+the shared [DP and DP3 walkthrough](../../../../../docs/baseline_training.md).
+The example below uses the original GraspPan v0 task for a longer DP3 run.
+
 ### 0. Fetch assets and teleop demonstrations
 
-The DexVerse Hugging Face dataset is gated — log in once and accept the
-terms on the dataset page before running these:
+The downloaders default to the public `dexverse/DexVerse_release` dataset;
+no login is required:
 
 ```bash
-huggingface-cli login                          # one-time
-python scripts/asset_tools/download_assets.py              # USD assets into source/dexverse/dexverse/assets/
+python scripts/asset_tools/download_robot_agents.py --bundle shadow
+python scripts/asset_tools/download_assets.py --core
 python scripts/demo_tools/download_demos.py --task functional/Dexverse-GraspPan-v0
 # (or --category functional for the whole category, or --all for everything)
 ```
@@ -91,8 +95,8 @@ teleop trajectories (joint-target actions + per-episode initial scene state) and
 
 ### 1. Replay demos headlessly and capture point clouds
 
-`scripts/demo_tools/create_demo_files_sequential.py` is the canonical headless replayer: it rolls the
-recorded actions through the simulator one episode at a time, captures the active
+`scripts/demo_tools/create_demo_files_sequential.py` is the canonical headless replayer: it restores
+recorded scene states one episode at a time, captures the active
 observation groups, and writes one HDF5 per task with the layout
 `data/demo_<i>/obs/<group>/<term>`.
 
@@ -100,6 +104,7 @@ observation groups, and writes one HDF5 per task with the layout
 python scripts/demo_tools/create_demo_files_sequential.py \
     --task functional/Dexverse-GraspPan-v0 \
     --obs-groups pointcloud \
+    --set-state --device cpu --seed 42 --headless \
     --output-dir outputs/demos_h5
 ```
 
@@ -117,7 +122,7 @@ was used, so downstream tools can spawn the env with the same obs space.
 
 ```bash
 python scripts/dp3/convert_demos_to_dp3.py \
-    --input_h5 outputs/demos_h5/functional/Dexverse-GraspPan-v0/Dexverse-GraspPan-v0.pointcloud.seq.demo.h5 \
+    --input_h5 outputs/demos_h5/v0/functional/Dexverse-GraspPan-v0/Dexverse-GraspPan-v0.pointcloud.seq.demo.h5 \
     --out_file outputs/dp3_graspPan.hdf5 \
     --num_points 512
 ```
@@ -165,8 +170,12 @@ python scripts/dp3/eval_online.py \
     --output_dir runs/dp3_graspPan_eval \
     --num_episodes 20 \
     --max_steps 500 \
-    --replan_interval 8
+    --replan_interval 8 \
+    --device cpu --headless
 ```
+
+This evaluation command uses CPU for physics and policy inference; rendering
+still uses the GPU.
 
 `--enable_cameras` is auto-set when the preset includes a camera-driven group
 (`pointcloud` / `3view_pointcloud`). Pass `--no_auto_enable_cameras` if you need
